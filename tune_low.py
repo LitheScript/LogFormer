@@ -15,97 +15,120 @@ from dataloader import DataGenerator
 from model import Model
 
 parser = argparse.ArgumentParser()
-# fine-tuning setting
+# 预训练模型的日志数据集名称
 parser.add_argument('--pretrained_log_name', type=str,
                     default='BGL', help='log file name')
+# 预训练模型加载路径                    
 parser.add_argument("--load_path", type=str,
                     default='checkpoints/train_BGL_classifier_1_64_1e-05-best.pt', help="latest model path")
+# 目标数据集名称
 parser.add_argument('--log_name', type=str,
                     default='HDFS', help='log file name')
+# 微调模式: adapter或classifier
 parser.add_argument('--tune_mode', type=str, default='adapter',
                     help='tune adapter or classifier only')
-# model setting
+# 模型设置
 parser.add_argument('--num_layers', type=int, default=1,
                     help='num of encoder layer')
-parser.add_argument('--lr', type=float, default=5e-5)
+parser.add_argument('--lr', type=float, default=5e-5)  # 学习率
 parser.add_argument('--window_size', type=int,
                     default='50', help='log sequence length')
 parser.add_argument('--adapter_size', type=int, default=64,
                     help='adapter size')
 parser.add_argument('--epoch', type=int, default=20,
                     help='epoch')
+# 训练样本数量限制
 parser.add_argument('--num_samples', type=int, default=20000,
-                    help='epoch')
+                    help='number of training samples')
+
+# 解析参数
 args = parser.parse_args()
+# 生成结果文件的后缀名,包含数据集转移信息
 suffix = f'{args.log_name}_from_{args.pretrained_log_name}_{args.tune_mode}_{args.num_layers}_{args.adapter_size}_{args.lr}_{args.epoch}'
 
+# 创建结果文件并写入参数配置
 with open(f'result_{args.num_samples}/tune_{suffix}.txt', 'w', encoding='utf-8') as f:
     f.write(str(args)+'\n')
 
-# hyper-parameters
-EMBEDDING_DIM = 768
-batch_size = 64
-epochs = args.epoch
+# ===== 超参数设置 =====
+EMBEDDING_DIM = 768  # 词嵌入维度
+batch_size = 64     # 批次大小
+epochs = args.epoch  # 训练轮数
+# 设置计算设备(GPU/CPU)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-device_ids = [0, 1]
+device_ids = [0, 1] # 多GPU训练设置
 
-# fix all random seeds
-warnings.filterwarnings('ignore')
-torch.manual_seed(123)
-torch.cuda.manual_seed(123)
-np.random.seed(123)
-random.seed(123)
-torch.backends.cudnn.deterministic = True
-# torch.backends.cudnn.benchmark = True
+# ===== 固定随机种子 =====
+warnings.filterwarnings('ignore')  # 忽略警告信息
+torch.manual_seed(123)            # 设置PyTorch的随机种子
+torch.cuda.manual_seed(123)       # 设置CUDA的随机种子
+np.random.seed(123)              # 设置NumPy的随机种子
+random.seed(123)                 # 设置Python的随机种子
+torch.backends.cudnn.deterministic = True  # 确保CUDNN的确定性
 
-# load data Hdfs
+# ===== 数据加载 =====
+# 加载训练数据
 training_data = np.load(
     f'./preprocessed_data/{args.log_name}_training.npz', allow_pickle=True)
-# load test data Hdfs
+# 加载测试数据
 testing_data = np.load(
     f'./preprocessed_data/{args.log_name}_testing.npz', allow_pickle=True)
-x_train, y_train = training_data['x'], training_data['y']
-x_test, y_test = testing_data['x'], testing_data['y']
-del testing_data
+x_train, y_train = training_data['x'], training_data['y']  # 提取训练数据和标签
+x_test, y_test = testing_data['x'], testing_data['y']      # 提取测试数据和标签
+del testing_data  # 释放内存
 del training_data
 
+# ===== 创建数据加载器 =====
+# 创建训练数据生成器(使用限定数量的样本)
 train_generator = DataGenerator(x_train[:args.num_samples], y_train[:args.num_samples], args.window_size)
+# 创建测试数据生成器
 test_generator = DataGenerator(x_test, y_test, args.window_size)
+# 创建训练数据加载器
 train_loader = torch.utils.data.DataLoader(
     train_generator, batch_size=batch_size, shuffle=True)
+# 创建测试数据加载器
 test_loader = torch.utils.data.DataLoader(
     test_generator, batch_size=batch_size, shuffle=False)
 
-# load pretrained model
-model = Model(mode='adapter', num_layers=args.num_layers, adapter_size=args.adapter_size, dim=EMBEDDING_DIM, window_size=args.window_size, nhead=8, dim_feedforward=4 *
-              EMBEDDING_DIM, dropout=0.1)
-# fine tuning setting
+# ===== 模型初始化 =====
+# 创建模型实例
+model = Model(mode='adapter', num_layers=args.num_layers, adapter_size=args.adapter_size, 
+             dim=EMBEDDING_DIM, window_size=args.window_size, nhead=8, 
+             dim_feedforward=4*EMBEDDING_DIM, dropout=0.1)
+
+# ===== 设置微调模式 =====
 if args.tune_mode == 'adapter':
-    model.train_adapter()
+    model.train_adapter()  # 只训练adapter层
 elif args.tune_mode == 'classifier':
-    model.train_classifier()
-model = model.to(device)
-model = torch.nn.DataParallel(model, device_ids=device_ids)
+    model.train_classifier()  # 只训练分类器层
+model = model.to(device)  # 将模型移至GPU
+model = torch.nn.DataParallel(model, device_ids=device_ids)  # 多GPU并行
 
-
-if args.pretrained_log_name != 'random':
-    checkpoint = torch.load(args.load_path)
+# ===== 加载预训练模型 =====
+if args.pretrained_log_name != 'random':  # 如果不是随机初始化
+    checkpoint = torch.load(args.load_path)  # 加载预训练模型
     net = checkpoint['net']
+    # 移除分类器层的参数(将重新初始化)
     net.pop('module.fc1.weight')
     net.pop('module.fc1.bias')
+    # 加载模型参数
     r = model.load_state_dict(net, strict=False)
+    # 记录加载结果
     with open(f'result_{args.num_samples}/tune_{suffix}.txt', 'a', encoding='utf-8') as f:
         f.write(f'loading pretrained model {args.load_path}\n')
         f.write(f'loading result: {r}\n')
 
+# ===== 优化器设置 =====
+optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=0)  # Adam优化器
+criterion = nn.BCEWithLogitsLoss()  # 二分类交叉熵损失
 
-optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=0)
-criterion = nn.BCEWithLogitsLoss()
+# ===== 初始化训练指标 =====
+best_f1 = 0  # 最佳F1分数
+start_epoch = -1  # 起始轮数
+log_interval = 100  # 日志打印间隔
 
-best_f1 = 0
-start_epoch = -1
-log_interval = 100
-for epoch in range(start_epoch+1, epochs):
+# ===== 训练循环 =====
+for epoch in range(start_epoch + 1, epochs):
     loss_all, f1_all = [], []
     train_loss = 0
     train_pred, train_true = [], []

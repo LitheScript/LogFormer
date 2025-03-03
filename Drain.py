@@ -333,12 +333,32 @@ class LogParser:
         return headers, regex
 
     def get_parameter_list(self, row):
-        template_regex = re.sub(r"<.{1,5}>", "<*>", row["EventTemplate"])
-        if "<*>" not in template_regex: return []
-        template_regex = re.sub(r'([^A-Za-z0-9])', r'\\\1', template_regex)
-        template_regex = re.sub(r'\\ +', r'\s+', template_regex)
-        template_regex = "^" + template_regex.replace("\<\*\>", "(.*?)") + "$"
-        parameter_list = re.findall(template_regex, row["Content"])
-        parameter_list = parameter_list[0] if parameter_list else ()
-        parameter_list = list(parameter_list) if isinstance(parameter_list, tuple) else [parameter_list]
-        return parameter_list
+        """
+        获取日志消息中的参数列表
+        输入:
+            row: 包含EventTemplate和Content的DataFrame行
+        输出:
+            参数列表
+        """
+        try:
+            # 1. 预处理模板
+            template_regex = re.sub(r"<.{1,5}>", "<*>", row["EventTemplate"])
+            if "<*>" not in template_regex:
+                return []
+            
+            # 2. 构建正则表达式
+            template_regex = re.sub(r'([^A-Za-z0-9])', r'\\\1', template_regex)
+            # 修改这行，直接使用空格而不是\s
+            template_regex = re.sub(r'\\\s+', ' +', template_regex)
+            template_regex = "^" + template_regex.replace("\<\*\>", "(.*?)") + "$"
+            
+            # 3. 提取参数
+            parameter_list = re.findall(template_regex, row["Content"])
+            if not parameter_list:
+                return []
+            # 处理不同的返回类型
+            parameter_list = parameter_list[0] if parameter_list else ()
+            return list(parameter_list) if isinstance(parameter_list, tuple) else [parameter_list]
+        except Exception as e:
+            print(f"Error in get_parameter_list: {str(e)}")
+            return []

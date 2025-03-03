@@ -6,71 +6,142 @@ import ast
 import re
 import torch
 from sentence_transformers import SentenceTransformer
+import gc
+import os
 
-
-def preprocess_data(df, mode):
-    x_data, y_data = [], []
-    if len(df) % 20 != 0:
-        print('error length')
-        return
-
-    num_windows = int(len(df) / 20)
-    for i in tqdm(range(num_windows)):
-        df_blk = df[i*20:i*20+20]
-        x_data.append(np.array(df_blk["Vector"].tolist()))
-        labels = df_blk["Label"].tolist()
-        if labels == ['-']*20:
-            y = [1, 0]
-        else:
-            y = [0, 1]
-        y_data.append(y)
-
-    np.savez(f'preprocessed_data/{log_name}_{mode}_data.npz',
-             x=x_data, y=y_data)
-
-
-if __name__ == '__main__':
-    num_workers = 6
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    model = SentenceTransformer(
-        'distilbert-base-nli-mean-tokens', device=device)
-
-    # load data
-    log_name = 'BGL'
-    df_template = pd.read_csv(f"parse_result/{log_name}.log_templates.csv")
-    df_structured = pd.read_csv(f"parse_result/{log_name}.log_structured.csv")
-
-    # calculate vectors for all known templates
-    print('vector embedding...')
-    embeddings = model.encode(
-        df_template['EventTemplate'].tolist())  # num_workers=num_workers)
-    df_template['Vector'] = list(embeddings)
-    template_dict = df_template.set_index('EventTemplate')['Vector'].to_dict()
-
-    # convert templates to vectors for all logs
+def batch_encode_templates(model, templates, batch_size=16):
+    """批量编码模板，使用更小的batch_size"""
     vectors = []
-    for idx, template in enumerate(df_structured['EventTemplate']):
+    for i in tqdm(range(0, len(templates), batch_size)):
+        batch = templates[i:i+batch_size]
+        with torch.no_grad():
+            batch_vectors = model.encode(batch, show_progress_bar=False)
+        vectors.extend(batch_vectors)
+        torch.cuda.empty_cache() if torch.cuda.is_available() else gc.collect()
+    return vectors
+
+def process_chunk(df_chunk, template_dict, model, chunk_idx, mode):
+    """处理单个数据块并保存中间结果"""
+    vectors = []
+    for template in tqdm(df_chunk['EventTemplate'], 
+                        desc=f"Processing chunk {chunk_idx}",
+                        leave=False):
         try:
             vectors.append(template_dict[template])
         except KeyError:
-            # new template
-            vectors.append(model.encode(template))
-    df_structured['Vector'] = vectors
-    print('done')
-    df_structured.drop(
-        columns=['Date', 'Node', 'Time', 'NodeRepeat', 'Type', 'Component', 'Level'])
+            with torch.no_grad():
+                vectors.append(model.encode(template))
+    
+    df_chunk['Vector'] = vectors
+    
+    temp_file = f'temp_{mode}_chunk_{chunk_idx}.npz'
+    x_data, y_data = [], []
+    
+    for i in range(0, len(df_chunk), 20):
+        if i + 20 <= len(df_chunk):
+            df_blk = df_chunk.iloc[i:i+20]
+            x_data.append(np.array(df_blk["Vector"].tolist()))
+            labels = df_blk["Label"].tolist()
+            y_data.append([1, 0] if labels == ['-']*20 else [0, 1])
+    
+    if x_data:
+        np.savez(temp_file, x=np.array(x_data), y=np.array(y_data))
+    
+    del vectors, x_data, y_data, df_chunk
+    gc.collect()
+    return temp_file
 
-    num_windows = len(df_structured)//20
-    df_structured = df_structured.iloc[:num_windows*20]
+def merge_temp_files(temp_files, mode, log_name):
+    """合并临时文件"""
+    all_x, all_y = [], []
+    
+    for temp_file in temp_files:
+        data = np.load(temp_file)
+        all_x.extend(data['x'])
+        all_y.extend(data['y'])
+        os.remove(temp_file)
+    
+    # 保持原始文件命名
+    np.savez(f'preprocessed_data/{log_name}_{mode}.npz',
+             x=np.array(all_x), y=np.array(all_y))
+    
+    del all_x, all_y
+    gc.collect()
 
-    training_windows = (num_windows//5)*4
-    df_structured['Usage'] = 'testing'
-    df_structured.iloc[:training_windows*20,
-                       df_structured.columns.get_loc('Usage')] = 'training'
-
-    df_test = df_structured[df_structured['Usage'] == 'testing']
-    df_train = df_structured[df_structured['Usage'] == 'training']
-
-    # preprocess data
-    preprocess_data(df_train, 'training')
-    preprocess_data(df_test, 'testing')
+if __name__ == '__main__':
+    # 设置参数
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    batch_size = 16
+    chunk_size = 500
+    log_name = 'BGL'
+    
+    # 创建临时目录
+    if not os.path.exists('preprocessed_data'):
+        os.makedirs('preprocessed_data')
+    
+    # 使用原始模型
+    print('Loading model...')
+    model = SentenceTransformer('distilbert-base-nli-mean-tokens', device=device)
+    
+    # 处理模板
+    print('Processing templates...')
+    df_template = pd.read_csv(f"parse_result/{log_name}.log_templates.csv")
+    embeddings = batch_encode_templates(model, df_template['EventTemplate'].tolist(), batch_size)
+    template_dict = dict(zip(df_template['EventTemplate'], embeddings))
+    del df_template, embeddings
+    gc.collect()
+    
+    # 分块读取和处理结构化日志
+    print('Processing structured logs...')
+    chunks = pd.read_csv(f"parse_result/{log_name}.log_structured.csv", 
+                        chunksize=chunk_size)
+    
+    temp_files_train = []
+    temp_files_test = []
+    total_rows = 0
+    
+    # 计算总行数用于划分训练集和测试集
+    for chunk in pd.read_csv(f"parse_result/{log_name}.log_structured.csv", 
+                           chunksize=chunk_size):
+        total_rows += len(chunk)
+    
+    training_rows = (total_rows//20//5)*4*20  # 保持原始的80/20分割
+    current_rows = 0
+    chunk_idx = 0
+    
+    # 重新读取并处理数据
+    chunks = pd.read_csv(f"parse_result/{log_name}.log_structured.csv", 
+                        chunksize=chunk_size)
+    
+    for chunk in chunks:
+        # 删除不需要的列
+        columns_to_drop = ['Date', 'Node', 'Time', 'NodeRepeat', 'Type', 
+                          'Component', 'Level']
+        existing_columns = [col for col in columns_to_drop if col in chunk.columns]
+        if existing_columns:
+            chunk = chunk.drop(columns=existing_columns)
+        
+        # 确定当前chunk是训练集还是测试集
+        if current_rows < training_rows:
+            mode = 'training'
+            temp_files_train.append(process_chunk(chunk, template_dict, model, 
+                                                chunk_idx, mode))
+        else:
+            mode = 'testing'
+            temp_files_test.append(process_chunk(chunk, template_dict, model, 
+                                               chunk_idx, mode))
+        
+        current_rows += len(chunk)
+        chunk_idx += 1
+        gc.collect()
+    
+    # 合并临时文件
+    print('Merging training files...')
+    merge_temp_files(temp_files_train, 'training', log_name)
+    print('Merging testing files...')
+    merge_temp_files(temp_files_test, 'testing', log_name)
+    
+    # 清理最终内存
+    del template_dict, model
+    gc.collect()
+    torch.cuda.empty_cache() if torch.cuda.is_available() else None

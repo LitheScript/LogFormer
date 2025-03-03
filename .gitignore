@@ -1,0 +1,7 @@
+checkpoints/
+log_data/
+parse_result/
+preprocessed_data/
+result/
+result_50000/
+__pycache__/
