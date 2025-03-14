@@ -4,6 +4,8 @@ import time     # 时间计算
 import os       # 文件操作
 import random   # 随机数生成
 import warnings # 警告控制
+import math     # 数学计算
+import torch.nn.functional as F  # 激活函数
 
 # 导入科学计算和深度学习相关库
 import numpy as np
@@ -46,7 +48,7 @@ parser.add_argument("--load_path", type=str,
 # 解析参数
 args = parser.parse_args()
 # 生成结果文件的后缀名,包含数据集、模型模式、层数等信息
-suffix = f'{args.log_name}_{args.mode}_{args.num_layers}_{args.adapter_size}_{args.lr}'
+suffix = f'{args.log_name}_{args.mode}_{args.num_layers}_{args.adapter_size}_{args.lr}_param_attn'
 # 创建结果文件并写入参数配置
 with open(f'result/train_{suffix}.txt', 'a', encoding='utf-8') as f:
     f.write(str(args)+'\n')
@@ -72,24 +74,86 @@ random.seed(123)                 # 设置Python的随机种子
 torch.backends.cudnn.deterministic = True  # 确保CUDNN的确定性
 
 # 加载训练和测试数据
-training_data = np.load(
-    f'./preprocessed_data/{args.log_name}_training.npz', allow_pickle=True)
-testing_data = np.load(
-    f'./preprocessed_data/{args.log_name}_testing.npz', allow_pickle=True)
-x_train, y_train = training_data['x'], training_data['y']  # 提取训练数据和标签
-x_test, y_test = testing_data['x'], testing_data['y']      # 提取测试数据和标签
-del testing_data  # 释放内存
-del training_data
+training_data = np.load(f'./preprocessed_data/{args.log_name}_training_param_attn_test_60000.npz', 
+                       allow_pickle=True)
+testing_data = np.load(f'./preprocessed_data/{args.log_name}_testing_param_attn_test_60000.npz',
+                      allow_pickle=True)
+
+class DataGenerator(torch.utils.data.Dataset):
+    def __init__(self, x_template, x_param, y, window_size):
+        self.x_template = x_template
+        self.x_param = x_param
+        self.y = y
+        self.window_size = window_size
+    
+    def __len__(self):
+        return len(self.x_template)
+    
+    def __getitem__(self, index):
+        template_seq = self.x_template[index]
+        param_seqs = self.x_param[index]
+        
+        # 处理序列长度
+        if len(template_seq) > self.window_size:
+            template_seq = template_seq[:self.window_size]
+            param_seqs = param_seqs[:self.window_size]
+        else:
+            pad_len = self.window_size - len(template_seq)
+            template_seq = np.pad(template_seq, ((0, pad_len), (0, 0)), 'constant')
+        
+        # 处理参数序列，保持每个位置原始的参数数量
+        processed_param_seqs = []
+        for params in param_seqs:
+            # 直接将参数转换为tensor，保持原始数量
+            params_tensor = torch.FloatTensor(np.array(params))  # [num_params, 768]
+            processed_param_seqs.append(params_tensor)
+        
+        # 填充序列长度到window_size（使用空tensor）
+        if len(processed_param_seqs) < self.window_size:
+            # 使用空tensor作为填充
+            zero_padding = [torch.zeros((0, 768)) for _ in range(self.window_size - len(processed_param_seqs))]
+            processed_param_seqs.extend(zero_padding)
+        
+        template_tensor = torch.FloatTensor(template_seq)  # [window_size, 768]
+        y_tensor = torch.FloatTensor(self.y[index])
+        
+        return (template_tensor, processed_param_seqs), y_tensor
+
+def custom_collate(batch):
+    # 分离数据和标签
+    data = [item[0] for item in batch]
+    labels = [item[1] for item in batch]
+    
+    # 分离模板和参数
+    templates = [d[0] for d in data]
+    params = [d[1] for d in data]  # 这是一个列表的列表的列表
+    
+    # 确保所有序列具有相同的维度
+    template_batch = torch.stack(templates)  # [batch_size, window_size, template_dim]
+    label_batch = torch.stack(labels)      # [batch_size, num_classes]
+    
+    # 不对参数进行stack操作，保持列表形式
+    # params结构: [batch_size][window_size][num_params, 768]
+    
+    return (template_batch, params), label_batch
 
 # 创建数据生成器和加载器
-train_generator = DataGenerator(x_train, y_train, args.window_size)  # 训练数据生成器
-test_generator = DataGenerator(x_test, y_test, args.window_size)     # 测试数据生成器
+train_generator = DataGenerator(training_data['x_template'], training_data['x_param'], training_data['y'], args.window_size)
+test_generator = DataGenerator(testing_data['x_template'], testing_data['x_param'], testing_data['y'], args.window_size)
 # 创建训练数据加载器,启用随机打乱
 train_loader = torch.utils.data.DataLoader(
-    train_generator, batch_size=batch_size, shuffle=True)
+    train_generator, 
+    batch_size=batch_size, 
+    shuffle=True,
+    collate_fn=custom_collate
+)
 # 创建测试数据加载器,不打乱顺序
 test_loader = torch.utils.data.DataLoader(
-    test_generator, batch_size=batch_size, shuffle=False)
+    test_generator, 
+    batch_size=batch_size, 
+    shuffle=False,
+    collate_fn=custom_collate
+)
 
 # 初始化模型
 model = Model(mode=args.mode,                # 模型模式(adapter/classifier)
@@ -139,13 +203,15 @@ for epoch in range(start_epoch+1, epochs):
     # 批次训练循环
     for batch_idx, data in enumerate(tqdm(train_loader)):
         # 准备数据
-        x, y = data[0].to(device), data[1].to(device)  # 将数据移至GPU
-        x = x.to(torch.float32)  # 转换输入数据类型
-        y = y.to(torch.float32)  # 转换标签数据类型
+        (x_template, x_param), y = data
+        x_template = x_template.to(device)
+        # 将参数列表中的每个tensor移到GPU
+        x_param = [[p.to(device) for p in seq] for seq in x_param]
+        y = y.to(device).float()
         
         # 前向传播
-        out = model(x)  # 模型预测
-        loss = criterion(out, y)  # 计算损失
+        out = model((x_template, x_param))
+        loss = criterion(out, y)
         
         # 反向传播和优化
         optimizer.zero_grad()  # 清空梯度
@@ -197,13 +263,17 @@ for epoch in range(start_epoch+1, epochs):
     acc = 0.0
     
     # 在测试集上评估
-    with torch.no_grad():  # 不计算梯度
+    with torch.no_grad():
         for batch_idx, data in enumerate(tqdm(test_loader)):
             # 准备数据
-            x, y = data[0].to(device), data[1].to(device)
-            x = x.to(torch.float32)
-            y = y.to(torch.float32)
-            out = model(x).cpu()  # 模型预测并移至CPU
+            (x_template, x_param), y = data
+            x_template = x_template.to(device).float()
+            # 将参数列表中的每个tensor移到GPU
+            x_param = [[p.to(device) for p in seq] for seq in x_param]
+            y = y.to(device).float()
+            
+            # 模型输入改为元组形式
+            out = model((x_template, x_param)).cpu()
             
             # 收集预测结果
             if batch_idx == 0:
@@ -222,7 +292,7 @@ for epoch in range(start_epoch+1, epochs):
     # 写入评估结果
     with open(f'result/train_{suffix}.txt', 'a', encoding='utf-8') as f:
         f.write('number of epochs:'+str(epoch)+'\n')
-        f.write('Number of testing data:'+str(x_test.shape[0])+'\n')
+        f.write('Number of testing data:'+str(x_template.shape[0])+'\n')
         f.write('Precision:'+str(report[0])+'\n')
         f.write('Recall:'+str(report[1])+'\n')
         f.write('F1 score:'+str(report[2])+'\n')
@@ -231,7 +301,7 @@ for epoch in range(start_epoch+1, epochs):
         f.close()
     
     # 打印评估结果
-    print(f'Number of testing data: {x_test.shape[0]}')
+    print(f'Number of testing data: {x_template.shape[0]}')
     print(f'Precision: {report[0]:.4f}')
     print(f'Recall: {report[1]:.4f}')
     print(f'F1 score: {report[2]:.4f}')
@@ -247,7 +317,7 @@ for epoch in range(start_epoch+1, epochs):
     if report[2] > best_f1:
         best_f1 = report[2]
         torch.save(checkpoint, os.path.join(
-            ckpt_path, f'train_{suffix}-best.pt'))
+            ckpt_path, f'train_{suffix}-best.pt'))  # 包含param_attn标识
     # 保存最新模型
     torch.save(checkpoint, os.path.join(
-        ckpt_path, f'train_{suffix}-latest.pt'))
+        ckpt_path, f'train_{suffix}-latest.pt'))  # 包含param_attn标识

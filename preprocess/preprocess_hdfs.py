@@ -15,7 +15,7 @@ sys.path.append('/workspace/2025/LogFormer')
 import Drain
 
 log_name = 'HDFS'
-input_dir = 'log_data/'  # The input directory of log file
+input_dir = 'log_data/preprocessed/'  # The input directory of log file
 output_dir = 'parse_result/'  # The output directory of parsing results
 
 
@@ -27,118 +27,121 @@ def check_memory():
     return memory_gb
 
 
-def preprocess_data(df, mode, batch_size=1000):
-    """分批处理数据以减少内存使用"""
-    x_data, y_data = [], []
-    unique_blocks = df['BlockId'].unique()
-    total_blocks = len(unique_blocks)
-    pbar = tqdm(total=total_blocks, desc=f'{mode} data collection')
-    
-    # 分批处理
-    for i in range(0, total_blocks, batch_size):
-        batch_blocks = unique_blocks[i:i+batch_size]
-        batch_df = df[df['BlockId'].isin(batch_blocks)]
-        
-        # 处理当前批次
-        for blk_id in batch_blocks:
-            blk_data = batch_df[batch_df['BlockId'] == blk_id]
-            if len(blk_data) > 0:
-                x_data.append(np.array(blk_data['Vector'].tolist()))
-                y_index = int(blk_data.iloc[0]['Label'] == 'Anomaly')
-                y = [0, 0]
-                y[y_index] = 1
-                y_data.append(y)
-                pbar.update(1)
-        
-        # 当累积一定数量的数据后保存并清理
-        if len(x_data) >= batch_size:
-            # 保存当前批次
-            temp_file = f'preprocessed_data/{log_name}_{mode}_temp_{i}.npz'
-            np.savez(temp_file, 
-                    x=np.array(x_data, dtype=object),
-                    y=np.array(y_data))
-            x_data = []
-            y_data = []
-            # 清理内存
-            del batch_df
-            gc.collect()
-            check_memory()
-    
-    # 保存最后一批
-    if x_data:
-        temp_file = f'preprocessed_data/{log_name}_{mode}_temp_final.npz'
-        np.savez(temp_file,
-                x=np.array(x_data, dtype=object),
-                y=np.array(y_data))
-    
-    pbar.close()
-    
-    # 合并所有临时文件
-    merge_temp_files(mode)
+def preprocess_data(df, mode):
+    """处理数据并保存为最终文件"""
+    x_template_data = []
+    x_param_data = []
+    y_data = []
+    pbar = tqdm(total=df['BlockId'].nunique(),
+                desc=f'{mode} data collection')
 
-def merge_temp_files(mode):
-    """合并临时文件，将测试集分成两部分保存"""
-    print(f'Merging {mode} files...')
-    all_x = []
-    all_y = []
+    while len(df) > 0:
+        blk_id = df.iloc[0]['BlockId']
+        last_index = 0
+        for i in range(len(df)):
+            if df.iloc[i]['BlockId'] != blk_id:
+                break
+            last_index += 1
+
+        df_blk = df[:last_index]
+        x_template_data.append(df_blk['TemplateVector'].tolist())
+        x_param_data.append(df_blk['ParamVector'].tolist())
+
+        y_index = int(df_blk.iloc[0]['Label'] == 'Anomaly')
+        y = [0, 0]
+        y[y_index] = 1
+        y_data.append(y)
+
+        df = df.iloc[last_index:]
+        pbar.update()
+    pbar.close()
+
+    print(f'Saving {mode} data...')
+    np.savez(f'preprocessed_data/{log_name}_{mode}_param_attn_test{output_suffix}.npz',
+             x_template=np.array(x_template_data, dtype=object),
+             x_param=np.array(x_param_data, dtype=object),
+             y=np.array(y_data))
     
-    temp_files = sorted(glob.glob(f'preprocessed_data/{log_name}_{mode}_temp_*.npz'))
-    total_files = len(temp_files)
+    print(f'Saved {len(x_template_data)} sequences')
+    print(f'Example sequence length: {len(x_template_data[0])}')
+
+
+def batch_process_parameters(params_list, batch_size=1000):
+    """批量处理参数列表
+    Args:
+        params_list: ParameterList列表
+        batch_size: 批处理大小
+    Returns:
+        processed_texts: 处理后的文本列表
+    """
+    processed_texts = []
+    for i in tqdm(range(0, len(params_list), batch_size), desc='Processing parameters'):
+        batch = params_list[i:i + batch_size]
+        # 批量处理ast.literal_eval
+        batch_processed = [' '.join(ast.literal_eval(params)) for params in batch]
+        processed_texts.extend(batch_processed)
+    return processed_texts
+
+
+def process_param_to_chars(param_str):
+    """将参数字符串转换为字符序列列表
+    Args:
+        param_str: 参数字符串，如'blk_-1608999687919862906 /10.250.19.102:54106'
+    Returns:
+        param_chars_list: 每个参数的字符序列列表
+    """
+    # 按空格分割参数
+    params = param_str.strip().split()
+    # 对每个参数进行字符级处理
+    param_chars_list = []
+    for param in params:
+        chars = ' '.join(list(param))
+        param_chars_list.append(chars)
+    return param_chars_list
+
+
+def batch_encode_parameters(params_list, model, batch_size=32):
+    """批量编码参数列表
+    Args:
+        params_list: 原始参数列表
+        model: BERT模型
+        batch_size: 批处理大小
+    Returns:
+        encoded_params_list: 每个日志的参数编码列表，每个参数一个向量
+    """
+    encoded_params_list = []
     
-    if mode == 'testing':
-        # 测试集分两部分处理
-        mid_point = total_files // 2
+    for i in tqdm(range(0, len(params_list), batch_size), desc='Encoding parameters'):
+        batch = params_list[i:i + batch_size]
+        batch_encoded_params = []
         
-        # 处理第一部分
-        print("Processing first half of testing data...")
-        for temp_file in tqdm(temp_files[:mid_point], desc='Merging files (part 1)'):
-            data = np.load(temp_file, allow_pickle=True)
-            all_x.extend(data['x'])
-            all_y.extend(data['y'])
-            del data
-            gc.collect()
-            os.remove(temp_file)
+        for params in batch:
+            # 处理参数字符串
+            param_chars_list = process_param_to_chars(params)
+            # 对每个参数单独编码
+            param_encodings = []
+            for char_seq in param_chars_list:
+                try:
+                    # 编码单个参数
+                    encoding = model.encode(char_seq,
+                                         show_progress_bar=False,
+                                         convert_to_numpy=True)
+                    param_encodings.append(encoding)
+                except Exception as e:
+                    print(f"Error encoding parameter {char_seq}: {e}")
+                    param_encodings.append(np.zeros(768))
+            
+            batch_encoded_params.append(param_encodings)
         
-        # 保存第一部分
-        np.savez(f'preprocessed_data/{log_name}_{mode}.npz',
-                 x=np.array(all_x, dtype=object),
-                 y=np.array(all_y))
-        del all_x, all_y
-        gc.collect()
-        
-        # 处理第二部分
-        print("Processing second half of testing data...")
-        all_x = []
-        all_y = []
-        for temp_file in tqdm(temp_files[mid_point:], desc='Merging files (part 2)'):
-            data = np.load(temp_file, allow_pickle=True)
-            all_x.extend(data['x'])
-            all_y.extend(data['y'])
-            del data
-            gc.collect()
-            os.remove(temp_file)
-        
-        # 保存第二部分
-        np.savez(f'preprocessed_data/{log_name}_{mode}_1.npz',
-                 x=np.array(all_x, dtype=object),
-                 y=np.array(all_y))
-    else:
-        # 训练集正常处理
-        for temp_file in tqdm(temp_files, desc='Merging files'):
-            data = np.load(temp_file, allow_pickle=True)
-            all_x.extend(data['x'])
-            all_y.extend(data['y'])
-            del data
-            gc.collect()
-            os.remove(temp_file)
-        
-        # 保存结果
-        np.savez(f'preprocessed_data/{log_name}_{mode}.npz',
-                 x=np.array(all_x, dtype=object),
-                 y=np.array(all_y))
+        encoded_params_list.extend(batch_encoded_params)
+    
+    return encoded_params_list
 
 
 if __name__ == '__main__':
+    test_size = 60000  # 测试数据大小
+    output_suffix = f'_{test_size}'  # 文件后缀
+
     if not os.path.exists(output_dir+log_name+'.log_structured.csv'):
         log_format = '<Date> <Time> <Pid> <Level> <Component>: <Content>'  # HDFS log format
         # Regular expression list for optional preprocessing (default: [])
@@ -157,55 +160,61 @@ if __name__ == '__main__':
     print('Initial memory usage:')
     check_memory()
 
-    num_workers = 6
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    model = SentenceTransformer(
-        'distilbert-base-nli-mean-tokens', device=device)
+    model = SentenceTransformer('distilbert-base-nli-mean-tokens', device=device)
 
     structured_file_name = log_name+'.log_structured.csv'
     template_file_name = log_name+'.log_templates.csv'
 
-    # load data
+    # [修改] 只读取前30000行数据
+    df_structured = pd.read_csv(output_dir + structured_file_name, nrows=test_size)
     df_template = pd.read_csv(output_dir + template_file_name)
-    df_structured = pd.read_csv(output_dir + structured_file_name)
-    df_label = pd.read_csv(input_dir+'preprocessed/anomaly_label.csv')
+    df_label = pd.read_csv(input_dir+'anomaly_label.csv')
 
     print('After loading data:')
     check_memory()
 
-    # calculate vectors for all known templates
-    print('vector embedding...')
-    with torch.no_grad():  # 添加这行来减少内存使用
-        embeddings = model.encode(
-            df_template['EventTemplate'].tolist())
-    df_template['Vector'] = list(embeddings)
-    template_dict = df_template.set_index('EventTemplate')['Vector'].to_dict()
-    del df_template, embeddings
-    gc.collect()
+    # 计算模板向量
+    print('Template vector embedding...')
+    embeddings = model.encode(df_template['EventTemplate'].tolist())
+    df_template['TemplateVector'] = list(embeddings)
+    template_dict = df_template.set_index('EventTemplate')['TemplateVector'].to_dict()
 
-    print('After template processing:')
+    # 转换模板为向量
+    template_vectors = []
+    for idx, template in enumerate(df_structured['EventTemplate']):
+        try:
+            template_vectors.append(template_dict[template])
+        except KeyError:
+            template_vectors.append(model.encode(template))
+    df_structured['TemplateVector'] = template_vectors
+
+    # [优化] 参数向量编码
+    print('Parameter vector embedding...')
+    # 1. 批量预处理参数
+    param_texts = batch_process_parameters(
+        df_structured['ParameterList'].tolist(), 
+        batch_size=1000
+    )
+    
+    # 2. 分批编码
+    print('Encoding parameters...')
+    param_vectors = batch_encode_parameters(
+        param_texts,
+        model,
+        batch_size=32
+    )
+    
+    df_structured['ParamVector'] = param_vectors
+    del param_texts, param_vectors  # 及时释放内存
+    gc.collect()
+    
+    print('Parameter encoding done')
     check_memory()
 
-    # convert templates to vectors for all logs
-    vectors = []
-    for idx, template in enumerate(df_structured['EventTemplate']):
-        if idx % 1000 == 0:  # 定期检查内存
-            if check_memory() > 35:
-                gc.collect()
-                torch.cuda.empty_cache() if torch.cuda.is_available() else None
-        try:
-            vectors.append(template_dict[template])
-        except KeyError:
-            with torch.no_grad():
-                vectors.append(model.encode(template))
-    df_structured['Vector'] = vectors
-    del vectors
-    gc.collect()
-    print('done')
-
-    # remove unused column
+    # 移除不需要的列
     df_structured.drop(columns=['Date', 'Time', 'Pid', 'Level', 'Component',
-                                'Content', 'EventId', 'EventTemplate'], axis=1, inplace=True)
+                              'Content', 'EventId', 'EventTemplate'], axis=1, inplace=True)
 
     # extract BlockId
     r1 = re.compile('^blk_-?[0-9]')
