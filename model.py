@@ -120,28 +120,12 @@ class ParamEncoder(nn.Module):
     def forward(self, param_vectors):
         """
         Args:
-            param_vectors: 列表的列表，每个内部列表包含该位置所有参数的向量
-                         shape: [batch_size, seq_len, num_params, 768]
+            param_vectors: [batch_size, seq_len, 768] 参数向量
         Returns:
-            encoded: shape [batch_size, seq_len, d_model]
+            encoded: [batch_size, seq_len, d_model]
         """
-        # 对每个参数向量进行线性映射
-        encoded = []
-        for batch in param_vectors:
-            batch_encoded = []
-            for seq_params in batch:
-                if len(seq_params) == 0:  # 处理空序列
-                    # 使用零向量
-                    seq_encoding = torch.zeros(self.d_model, 
-                                            device=self.char_embedding.weight.device)
-                else:
-                    # 将所有参数向量映射到相同维度并求平均
-                    param_embeddings = [self.char_embedding(p) for p in seq_params]
-                    seq_encoding = torch.stack(param_embeddings).mean(dim=0)
-                batch_encoded.append(seq_encoding)
-            encoded.append(torch.stack(batch_encoded))
-        
-        encoded = torch.stack(encoded)
+        # 直接对整个批次进行线性映射
+        encoded = self.char_embedding(param_vectors)  # [batch_size, seq_len, d_model]
         return self.norm(encoded)
 
 
@@ -181,24 +165,22 @@ class LogAttentionTransformerLayer(nn.Module):
         """
         Args:
             src: 模板序列 [batch_size, seq_len, d_model]
-            param_vectors: 参数向量列表的列表 [batch_size, seq_len, num_params, 768]
+            param_vectors: 参数向量 [batch_size, seq_len, 768]
         """
         batch_size = src.size(0)
         seq_len = src.size(1)
         head_dim = self.d_model // self.nhead
         
-        # 1. 参数编码：将每个位置的所有参数编码成一个向量
+        # 参数编码
         param_encoding = self.param_encoder(param_vectors)  # [batch_size, seq_len, d_model]
         
-        # 2. 计算注意力偏置
+        # 计算注意力偏置
         param_bias = param_encoding.view(batch_size, seq_len, self.nhead, head_dim)
         param_bias = param_bias.permute(0, 2, 1, 3)  # [batch_size, nhead, seq_len, head_dim]
-        
-        # 计算参数注意力偏置
         param_bias = torch.matmul(param_bias, param_bias.transpose(-2, -1))
-        param_bias = param_bias / math.sqrt(head_dim)  # [batch_size, nhead, seq_len, seq_len]
+        param_bias = param_bias / math.sqrt(head_dim)
         
-        # 3. 应用带参数偏置的注意力
+        # 应用带参数偏置的注意力
         # 注：直接使用nn.MultiheadAttention无法添加偏置，需要自己实现注意力计算
         q = src.view(batch_size, seq_len, self.nhead, head_dim).permute(0, 2, 1, 3)
         k = src.view(batch_size, seq_len, self.nhead, head_dim).permute(0, 2, 1, 3)

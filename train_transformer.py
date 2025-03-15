@@ -74,9 +74,9 @@ random.seed(123)                 # 设置Python的随机种子
 torch.backends.cudnn.deterministic = True  # 确保CUDNN的确定性
 
 # 加载训练和测试数据
-training_data = np.load(f'./preprocessed_data/{args.log_name}_training_param_attn_test_60000.npz', 
+training_data = np.load(f'./preprocessed_data/{args.log_name}_training_param_attn_test_with_param.npz', 
                        allow_pickle=True)
-testing_data = np.load(f'./preprocessed_data/{args.log_name}_testing_param_attn_test_60000.npz',
+testing_data = np.load(f'./preprocessed_data/{args.log_name}_testing_param_attn_test_with_param.npz',
                       allow_pickle=True)
 
 class DataGenerator(torch.utils.data.Dataset):
@@ -91,33 +91,22 @@ class DataGenerator(torch.utils.data.Dataset):
     
     def __getitem__(self, index):
         template_seq = self.x_template[index]
-        param_seqs = self.x_param[index]
+        param_seq = self.x_param[index]
         
         # 处理序列长度
         if len(template_seq) > self.window_size:
             template_seq = template_seq[:self.window_size]
-            param_seqs = param_seqs[:self.window_size]
+            param_seq = param_seq[:self.window_size]
         else:
             pad_len = self.window_size - len(template_seq)
             template_seq = np.pad(template_seq, ((0, pad_len), (0, 0)), 'constant')
-        
-        # 处理参数序列，保持每个位置原始的参数数量
-        processed_param_seqs = []
-        for params in param_seqs:
-            # 直接将参数转换为tensor，保持原始数量
-            params_tensor = torch.FloatTensor(np.array(params))  # [num_params, 768]
-            processed_param_seqs.append(params_tensor)
-        
-        # 填充序列长度到window_size（使用空tensor）
-        if len(processed_param_seqs) < self.window_size:
-            # 使用空tensor作为填充
-            zero_padding = [torch.zeros((0, 768)) for _ in range(self.window_size - len(processed_param_seqs))]
-            processed_param_seqs.extend(zero_padding)
+            param_seq = np.pad(param_seq, ((0, pad_len), (0, 0)), 'constant')
         
         template_tensor = torch.FloatTensor(template_seq)  # [window_size, 768]
+        param_tensor = torch.FloatTensor(param_seq)      # [window_size, 768]
         y_tensor = torch.FloatTensor(self.y[index])
         
-        return (template_tensor, processed_param_seqs), y_tensor
+        return (template_tensor, param_tensor), y_tensor
 
 def custom_collate(batch):
     # 分离数据和标签
@@ -126,16 +115,14 @@ def custom_collate(batch):
     
     # 分离模板和参数
     templates = [d[0] for d in data]
-    params = [d[1] for d in data]  # 这是一个列表的列表的列表
+    params = [d[1] for d in data]
     
-    # 确保所有序列具有相同的维度
-    template_batch = torch.stack(templates)  # [batch_size, window_size, template_dim]
+    # 堆叠成批次
+    template_batch = torch.stack(templates)  # [batch_size, window_size, 768]
+    param_batch = torch.stack(params)      # [batch_size, window_size, 768]
     label_batch = torch.stack(labels)      # [batch_size, num_classes]
     
-    # 不对参数进行stack操作，保持列表形式
-    # params结构: [batch_size][window_size][num_params, 768]
-    
-    return (template_batch, params), label_batch
+    return (template_batch, param_batch), label_batch
 
 # 创建数据生成器和加载器
 train_generator = DataGenerator(training_data['x_template'], training_data['x_param'], training_data['y'], args.window_size)
@@ -205,8 +192,7 @@ for epoch in range(start_epoch+1, epochs):
         # 准备数据
         (x_template, x_param), y = data
         x_template = x_template.to(device)
-        # 将参数列表中的每个tensor移到GPU
-        x_param = [[p.to(device) for p in seq] for seq in x_param]
+        x_param = x_param.to(device)
         y = y.to(device).float()
         
         # 前向传播
@@ -268,8 +254,7 @@ for epoch in range(start_epoch+1, epochs):
             # 准备数据
             (x_template, x_param), y = data
             x_template = x_template.to(device).float()
-            # 将参数列表中的每个tensor移到GPU
-            x_param = [[p.to(device) for p in seq] for seq in x_param]
+            x_param = x_param.to(device).float()
             y = y.to(device).float()
             
             # 模型输入改为元组形式
